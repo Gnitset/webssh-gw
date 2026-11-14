@@ -1,0 +1,27 @@
+[Unit]
+Description=Web SSH gateway (browser-side SSH crypto, dumb TCP relay)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Create a dedicated user:  sudo useradd -r -s /usr/sbin/nologin websshgw
+User=websshgw
+WorkingDirectory=/opt/webssh-gw
+# All settings live in this `key: value` config file (chmod 600, owned by
+# the service user) — see README for the full key list (listen, web, cert,
+# key, tokens, cookie-secret, cookie-ttl, dial-timeout, secure-cookie,
+# base-path, default-user, default-port, static-cache-ttl). Each key also
+# has a WEBSSH_<FLAG_NAME> environment variable
+# (e.g. add Environment=WEBSSH_TOKENS=... below) and a matching -flag; a flag
+# here would override both, but normally none are needed. Precedence is
+# default < file < env < flag.
+ExecStart=/opt/webssh-gw/webssh-gw -config /opt/webssh-gw/webssh-gw.conf
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
