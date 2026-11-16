@@ -12,6 +12,25 @@ term.loadAddon(fit);
 term.open(document.getElementById("term"));
 fit.fit();
 
+// Ctrl/Cmd+C copies when there's a selection, same as most terminal apps
+// (otherwise it falls through to xterm.js's default of sending SIGINT).
+// Ctrl/Cmd+V always pastes from the clipboard instead of sending xterm's
+// usual "literal next character" control code for that key.
+term.attachCustomKeyEventHandler((e) => {
+  if (e.type !== "keydown" || !(e.ctrlKey || e.metaKey)) return true;
+  if (e.key === "c" && term.hasSelection()) {
+    navigator.clipboard.writeText(term.getSelection());
+    return false;
+  }
+  if (e.key === "v") {
+    navigator.clipboard.readText().then((text) => {
+      if (connected && window.goSSHWrite) window.goSSHWrite(text);
+    });
+    return false;
+  }
+  return true;
+});
+
 let connected = false;
 
 // Go (wasm) calls these:
