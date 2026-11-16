@@ -134,9 +134,53 @@ focusHost();
 
 term.onData((d) => { if (connected && window.goSSHWrite) window.goSSHWrite(d); });
 
-window.addEventListener("resize", () => {
+function syncTerminalSize() {
   fit.fit();
   if (connected && window.goSSHResize) window.goSSHResize(term.cols, term.rows);
+}
+
+window.addEventListener("resize", syncTerminalSize);
+
+// Prompt before closing/navigating away while a session is live — e.g. a
+// Ctrl+W pressed outside fullscreen (where Keyboard Lock isn't active)
+// would otherwise drop the connection with no warning at all. Browsers
+// show their own generic text here regardless of what's set below.
+window.addEventListener("beforeunload", (e) => {
+  if (!connected) return;
+  e.preventDefault();
+  e.returnValue = "";
+});
+
+// Browsers reserve shortcuts like Ctrl+W/Ctrl+T and never deliver their
+// keydown to the page, no matter what a handler does — that's enforced
+// above the DOM, not something preventDefault() can override. The
+// Keyboard Lock API is the one sanctioned way around it, and only while
+// the page is in fullscreen. Once the keydown actually reaches xterm.js,
+// its own key handling already turns Ctrl+<letter> into the right control
+// byte, so no extra handling is needed here beyond getting the event
+// delivered at all.
+$("fullscreen").addEventListener("click", async () => {
+  if (document.fullscreenElement) {
+    await document.exitFullscreen();
+    return;
+  }
+  try {
+    await document.documentElement.requestFullscreen();
+    if (navigator.keyboard && navigator.keyboard.lock) {
+      await navigator.keyboard.lock();
+    }
+  } catch (err) {
+    setStatus("fullscreen failed: " + err);
+  }
+});
+
+document.addEventListener("fullscreenchange", () => {
+  const inFullscreen = !!document.fullscreenElement;
+  $("fullscreen").textContent = inFullscreen ? "exit fullscreen" : "fullscreen";
+  if (!inFullscreen && navigator.keyboard && navigator.keyboard.unlock) {
+    navigator.keyboard.unlock();
+  }
+  syncTerminalSize();
 });
 
 // ---------- wasm boot ----------
