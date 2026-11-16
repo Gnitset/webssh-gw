@@ -28,6 +28,10 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// buildTime is set via -ldflags "-X main.buildTime=..." (see Makefile and
+// Dockerfile); a plain `go build` with no flags leaves it at "unknown".
+var buildTime = "unknown"
+
 var (
 	configPath     = flag.String("config", "webssh-gw.conf", "path to a `key: value` config file; config keys match flag names (e.g. \"cookie-secret: ...\"), and any flag given on the command line overrides the matching config value")
 	listen         = flag.String("listen", ":8443", "listen address")
@@ -398,6 +402,7 @@ func requireAuth(next http.Handler) http.Handler {
 
 func main() {
 	flag.Parse()
+	log.Printf("webssh-gw build %s", buildTime)
 	loadConfig()
 	if *secret == "" {
 		log.Fatal("cookie-secret is required (set \"cookie-secret: ...\" in the config file, or pass -cookie-secret; e.g. output of: openssl rand -hex 32)")

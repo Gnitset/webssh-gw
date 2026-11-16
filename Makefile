@@ -1,6 +1,7 @@
 GO ?= go
 XTERM_VERSION ?= 5.5.0
 ADDON_FIT_VERSION ?= 0.10.0
+BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 .PHONY: all server wasm wasmexec deps vendor clean
 
@@ -23,7 +24,7 @@ web/addon-fit.js:
 	curl -L -o web/addon-fit.js https://unpkg.com/@xterm/addon-fit@$(ADDON_FIT_VERSION)/lib/addon-fit.js
 
 server:
-	$(GO) build -o webssh-gw ./server
+	$(GO) build -ldflags "-X main.buildTime=$(BUILD_TIME)" -o webssh-gw ./server
 
 wasm:
 	GOOS=js GOARCH=wasm $(GO) build -o web/main.wasm ./client

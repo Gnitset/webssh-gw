@@ -16,7 +16,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY server ./server
 COPY client ./client
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/webssh-gw ./server
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-X main.buildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)" -o /out/webssh-gw ./server
 RUN GOOS=js GOARCH=wasm go build -o /out/main.wasm ./client
 # wasm_exec.js moved from misc/wasm/ to lib/wasm/ in a later Go release
 # than this builder's; try both paths so this doesn't rot either way.
