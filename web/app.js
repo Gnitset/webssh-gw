@@ -1,15 +1,18 @@
 "use strict";
 
 // ---------- terminal ----------
+const termEl = document.getElementById("term");
+const scrollback = parseInt(termEl.dataset.scrollback, 10) || 1000;
 const term = new Terminal({
   cursorBlink: true,
   fontFamily: "monospace",
   fontSize: 14,
   theme: { background: "#000000" },
+  scrollback,
 });
 const fit = new FitAddon.FitAddon();
 term.loadAddon(fit);
-term.open(document.getElementById("term"));
+term.open(termEl);
 fit.fit();
 
 // Ctrl/Cmd+C copies when there's a selection, same as most terminal apps

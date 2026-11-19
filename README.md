@@ -92,7 +92,9 @@ connections go to the same account or a non-standard SSH port), and
 `app.js`/`xterm.js`/`main.wasm`; defaults to 5 minutes — short enough that a
 redeploy shows up quickly, long enough to avoid re-fetching a multi-MB wasm
 binary on every page load; `index.html` itself is never cached, since it's
-templated per request with the two defaults above). Blank lines are ignored,
+templated per request with these settings), and `scrollback` (number of
+terminal lines xterm.js keeps in its scrollback buffer; defaults to 10000).
+Blank lines are ignored,
 as are `#` comments — either a whole line or trailing after a value
 (wrap the value in quotes if it genuinely needs a literal `#`). It's a plain
 custom parser, not a shell-sourced file — hence `.conf`, not `.env`.

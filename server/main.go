@@ -51,6 +51,7 @@ var (
 	defaultUser    = flag.String("default-user", "", "default value pre-filled in the web UI's user field")
 	defaultPort    = flag.String("default-port", "22", "default value pre-filled in the web UI's port field")
 	staticCacheTTL = flag.Duration("static-cache-ttl", 5*time.Minute, "browser Cache-Control max-age for static assets (app.js, xterm.js, main.wasm, ...); index.html itself is never cached, since it's templated per request")
+	scrollback     = flag.Int("scrollback", 10000, "number of terminal lines xterm.js keeps in its scrollback buffer")
 	resumeGrace    = flag.Duration("resume-grace", 2*time.Hour, "how long a dropped browser connection may reattach to its still-running SSH session before the relay gives up and closes it")
 	resumeBufferMB = flag.Int64("resume-buffer-mb", 32, "per-session replay buffer size, in MB, for resuming a dropped connection; if a session's output exceeds this while disconnected, resuming becomes impossible and reconnecting requires a fresh login")
 )
@@ -650,9 +651,9 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // indexHandler intercepts the mounted root ("/" after StripPrefix) to inject
-// the configured default-user/default-port into index.html; every other
-// path (app.js, xterm.js, main.wasm, ...) falls through to the plain static
-// file server untouched.
+// the configured default-user/default-port/scrollback into index.html; every
+// other path (app.js, xterm.js, main.wasm, ...) falls through to the plain
+// static file server untouched.
 func indexHandler(fileServer http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -663,8 +664,8 @@ func indexHandler(fileServer http.Handler) http.Handler {
 			fileServer.ServeHTTP(w, r)
 			return
 		}
-		// index.html is templated per request (default-user/default-port)
-		// and small, so there's no real cost to never caching it.
+		// index.html is templated per request (default-user/default-port/
+		// scrollback) and small, so there's no real cost to never caching it.
 		w.Header().Set("Cache-Control", "no-store")
 		b, err := os.ReadFile(filepath.Join(*webDir, "index.html"))
 		if err != nil {
@@ -674,6 +675,7 @@ func indexHandler(fileServer http.Handler) http.Handler {
 		page := strings.NewReplacer(
 			"{{DEFAULT_USER}}", html.EscapeString(*defaultUser),
 			"{{DEFAULT_PORT}}", html.EscapeString(*defaultPort),
+			"{{SCROLLBACK}}", strconv.Itoa(*scrollback),
 		).Replace(string(b))
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Write([]byte(page))
