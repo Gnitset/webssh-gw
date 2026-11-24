@@ -43,6 +43,25 @@ window.sshClosed = () => {
   focusHost();
 };
 
+// The WebSocket to the gateway dropped (proxy idle-kill, tab was frozen,
+// network blip, ...) and a reconnect is in progress. The SSH session
+// itself is still alive server-side; this is purely a transport stall,
+// so the UI stays in the "connected" state rather than tearing down.
+window.sshReconnecting = () => setStatus("reconnecting…");
+window.sshReconnected = () => setStatus("reconnected");
+
+// Unlike sshReconnecting, this means the gateway could not be resumed at
+// all (its grace period lapsed, or too much happened while disconnected
+// to replay) — the SSH session is genuinely gone, same as sshClosed, but
+// worth saying why rather than leaving the terminal silently unresponsive.
+window.sshGaveUp = (reason) => {
+  connected = false;
+  setStatus("disconnected: " + reason);
+  toggle(false);
+  term.writeln("\r\n\x1b[31m*** session lost: " + reason + " ***\x1b[0m");
+  focusHost();
+};
+
 // known_hosts (trust-on-first-use), per host:port, stored in localStorage.
 window.hostKeyConfirm = (host, port, keyType, fpr) => {
   const k = `hk:${host}:${port}`;
