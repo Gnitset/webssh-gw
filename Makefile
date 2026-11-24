@@ -2,6 +2,7 @@ GO ?= go
 XTERM_VERSION ?= 5.5.0
 ADDON_FIT_VERSION ?= 0.10.0
 NOVNC_VERSION ?= 1.7.0
+IRON_RDP_VERSION ?= 0.7.0
 BUILD_TIME := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
 .PHONY: all server wasm wasmexec deps vendor clean
@@ -13,7 +14,7 @@ deps:
 
 # Fetched once and cached here; each target is skipped by make if the file
 # already exists. `make clean` removes them to force a re-fetch.
-vendor: web/xterm.js web/xterm.css web/addon-fit.js web/novnc/core/rfb.js
+vendor: web/xterm.js web/xterm.css web/addon-fit.js web/novnc/core/rfb.js web/iron-remote-desktop-rdp.js
 
 web/xterm.js:
 	curl -L -o web/xterm.js https://unpkg.com/@xterm/xterm@$(XTERM_VERSION)/lib/xterm.js
@@ -33,6 +34,12 @@ web/novnc/core/rfb.js:
 	mkdir -p web/novnc
 	curl -L https://registry.npmjs.org/@novnc/novnc/-/novnc-$(NOVNC_VERSION).tgz | tar xz -C web/novnc --strip-components=1 package/core package/vendor
 
+# Ships as one self-contained JS file with its wasm embedded as a base64
+# data: URI, so (unlike noVNC, and unlike real IronRDP, which needs a Rust/
+# wasm-pack toolchain to build) this is a single fetch, no build step.
+web/iron-remote-desktop-rdp.js:
+	curl -L -o web/iron-remote-desktop-rdp.js https://unpkg.com/@devolutions/iron-remote-desktop-rdp@$(IRON_RDP_VERSION)/iron-remote-desktop-rdp.js
+
 server:
 	$(GO) build -ldflags "-X main.buildTime=$(BUILD_TIME)" -o webssh-gw ./server
 
@@ -49,5 +56,5 @@ wasmexec:
 	@echo "wasm_exec.js copied"
 
 clean:
-	rm -f webssh-gw web/main.wasm web/wasm_exec.js web/xterm.js web/xterm.css web/addon-fit.js
+	rm -f webssh-gw web/main.wasm web/wasm_exec.js web/xterm.js web/xterm.css web/addon-fit.js web/iron-remote-desktop-rdp.js
 	rm -rf web/novnc

@@ -346,6 +346,12 @@ type session struct {
 	attachID        uint64
 	graceTimer      *time.Timer
 	finalized       bool
+
+	// wsWriteMu serializes every WriteMessage call on ws, from whichever
+	// goroutine — runAttachment's own handshake frames (session key,
+	// replay tail) and runDownload's live forwarding both go through it.
+	// See attach's comment for why this exists.
+	wsWriteMu sync.Mutex
 }
 
 var (
@@ -361,10 +367,32 @@ func newSessionKey() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-// attach validates replayFrom and bumps attachID, returning what the
-// caller needs to send its own handshake frames. It deliberately does NOT
-// yet publish conn as s.ws — see publishAttach.
-func (s *session) attach(replayFrom int64) (replayTail []byte, recvFromBrowser int64, attachID uint64, err error) {
+// attach validates replayFrom, bumps attachID, and publishes conn as s.ws —
+// all atomically under s.mu — returning what the caller needs to send as
+// its own handshake frames (session key, replay tail).
+//
+// Publishing conn here, in the same step as the tail snapshot, matters:
+// runDownload appends every byte it reads to s.buf first and only then
+// checks s.ws to decide whether to forward it live. If conn became visible
+// to runDownload any later than this snapshot, a chunk read in between —
+// after the tail was captured but before conn was published — would be
+// buffered but neither included in the tail nor sent live: silently lost.
+// That's not hypothetical: against a target that responds in well under a
+// millisecond (RDP on a local network, reliably; anything else, rarely but
+// possible), runDownload can win that race.
+//
+// The other half of the fix is wsWriteMu: the caller must hold it for the
+// whole handshake-writing sequence (through the tail write), and
+// runDownload must hold it for each live write too. Publishing conn here
+// makes s.ws live immediately, so without that lock runDownload could write
+// a freshly-arrived chunk concurrently with (or even before) the caller's
+// own handshake frames — gorilla/websocket requires ordinary WriteMessage
+// calls on one connection to be serialized (unlike WriteControl, its one
+// documented exception), and out-of-order delivery would confuse the
+// client regardless. Holding wsWriteMu across both makes the handshake
+// frames go first and blocks runDownload's write until they're done,
+// without losing whatever it read in the meantime.
+func (s *session) attach(conn *websocket.Conn, replayFrom int64) (replayTail []byte, recvFromBrowser int64, attachID uint64, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.finalized {
@@ -379,24 +407,8 @@ func (s *session) attach(replayFrom int64) (replayTail []byte, recvFromBrowser i
 	}
 	tail := append([]byte(nil), s.buf[replayFrom-s.bufStart:]...)
 	s.attachID++
+	s.ws = conn
 	return tail, s.recvFromBrowser, s.attachID, nil
-}
-
-// publishAttach makes conn visible to the session's permanent download
-// goroutine as the current live connection to write to. This must only
-// happen after the caller has finished writing its own handshake frames
-// (session key, replay tail) to conn: gorilla/websocket requires ordinary
-// WriteMessage calls on one connection to be serialized (unlike
-// WriteControl, its one documented exception), so publishing conn any
-// earlier would let the download goroutine's writes race with the
-// handshake's — which in practice corrupts the WebSocket framing on the
-// wire rather than panicking, making it a nasty one to debug blind.
-func (s *session) publishAttach(conn *websocket.Conn, attachID uint64) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.attachID == attachID { // not already superseded while we wrote the handshake
-		s.ws = conn
-	}
 }
 
 // detach clears s.ws (if attachID is still current — a detach from an
@@ -475,7 +487,12 @@ func (s *session) runDownload() {
 			s.mu.Unlock()
 
 			if ws != nil {
-				if werr := ws.WriteMessage(websocket.BinaryMessage, chunk); werr != nil {
+				// Serialized against runAttachment's own handshake writes
+				// on the same connection — see attach's comment.
+				s.wsWriteMu.Lock()
+				werr := ws.WriteMessage(websocket.BinaryMessage, chunk)
+				s.wsWriteMu.Unlock()
+				if werr != nil {
 					s.detach(attachID)
 				}
 			}
@@ -518,9 +535,24 @@ func (s *session) runUpload(conn *websocket.Conn, attachID uint64) {
 // runAttachment brings conn up to date (session key + how much of its
 // upload the server has already confirmed + any download tail it's missing)
 // and then relays until this attachment's WebSocket dies.
-func runAttachment(s *session, conn *websocket.Conn, replayFrom int64) {
-	tail, recvFromBrowser, attachID, err := s.attach(replayFrom)
+//
+// sendInitFrame controls the one TEXT control frame ({"session":...,
+// "recvAck":...}) that carries our own session-resume bookkeeping: SSH and
+// VNC clients know to ignore non-binary WebSocket frames, but that's a
+// convention of this project's own wasm/noVNC clients, not something a
+// third-party client like IronRDP's has any reason to expect. IronRDP
+// treats the connection as a plain byte stream, so splicing JSON text into
+// it corrupts the RDP protocol bytes with no visible error — it just hangs
+// forever. RDP has no use for the frame anyway (its client has no concept
+// of this resume protocol and would just open a fresh /rdp connection on
+// any drop), so rdpHandler passes false.
+func runAttachment(s *session, conn *websocket.Conn, replayFrom int64, sendInitFrame bool) {
+	// Held for the whole handshake-writing sequence below, including the
+	// attach() call that publishes conn as s.ws — see attach's comment.
+	s.wsWriteMu.Lock()
+	tail, recvFromBrowser, attachID, err := s.attach(conn, replayFrom)
 	if err != nil {
+		s.wsWriteMu.Unlock()
 		// Can't satisfy the requested replay point byte-for-byte — refuse
 		// rather than risk a silent gap that just fails later with a
 		// confusing corruption error. The client falls back to a fresh
@@ -532,18 +564,22 @@ func runAttachment(s *session, conn *websocket.Conn, replayFrom int64) {
 		return
 	}
 
-	initMsg, _ := json.Marshal(map[string]any{"session": s.key, "recvAck": recvFromBrowser})
-	if err := conn.WriteMessage(websocket.TextMessage, initMsg); err != nil {
-		conn.Close()
-		return
-	}
-	if len(tail) > 0 {
-		if err := conn.WriteMessage(websocket.BinaryMessage, tail); err != nil {
+	if sendInitFrame {
+		initMsg, _ := json.Marshal(map[string]any{"session": s.key, "recvAck": recvFromBrowser})
+		if err := conn.WriteMessage(websocket.TextMessage, initMsg); err != nil {
+			s.wsWriteMu.Unlock()
 			conn.Close()
 			return
 		}
 	}
-	s.publishAttach(conn, attachID)
+	if len(tail) > 0 {
+		if err := conn.WriteMessage(websocket.BinaryMessage, tail); err != nil {
+			s.wsWriteMu.Unlock()
+			conn.Close()
+			return
+		}
+	}
+	s.wsWriteMu.Unlock()
 
 	conn.SetReadDeadline(time.Now().Add(pongWait))
 	conn.SetPongHandler(func(string) error {
@@ -605,7 +641,7 @@ func resumeHandler(w http.ResponseWriter, r *http.Request) {
 		conn.Close()
 		return
 	}
-	runAttachment(s, conn, recv)
+	runAttachment(s, conn, recv, true)
 }
 
 func wsHandler(w http.ResponseWriter, r *http.Request) {
@@ -646,7 +682,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	go s.runDownload()
 
 	log.Printf("relay open: %s -> %s (session %s)", r.RemoteAddr, target, key[:8])
-	runAttachment(s, conn, 0)
+	runAttachment(s, conn, 0, true)
 	log.Printf("relay detached: %s -> %s (session %s)", r.RemoteAddr, target, key[:8])
 }
 
@@ -714,6 +750,7 @@ func main() {
 	mux.HandleFunc(basePath+"/logout", logoutHandler)
 	mux.HandleFunc(basePath+"/ws", wsHandler)
 	mux.HandleFunc(basePath+"/resume", resumeHandler)
+	mux.HandleFunc(basePath+"/rdp", rdpHandler)
 	fileServer := http.FileServer(http.Dir(*webDir))
 	mux.Handle(basePath+"/", requireAuth(http.StripPrefix(basePath, indexHandler(fileServer))))
 

@@ -36,7 +36,63 @@ term.attachCustomKeyEventHandler((e) => {
 
 let connected = false;
 let rfb = null;
+let rdpSession = null;
 const vncEl = document.getElementById("vnc");
+const rdpEl = document.getElementById("rdp");
+const rdpCanvas = document.getElementById("rdpCanvas");
+
+// JS KeyboardEvent.code -> PC/AT Set 1 scancode (what RDP's keyboard input
+// PDU wants). Extended keys (the right-hand modifiers, arrows, the nav
+// cluster, numpad enter/divide) are encoded as 0xE000 | code, since
+// DeviceEvent.keyPressed() takes a single number with no separate
+// "extended" flag. Covers everyday typing and navigation, not an
+// exhaustive 104-key table (numpad digits, media keys, etc. are missing).
+const RDP_SCANCODES = {
+  Escape: 0x01, Digit1: 0x02, Digit2: 0x03, Digit3: 0x04, Digit4: 0x05, Digit5: 0x06,
+  Digit6: 0x07, Digit7: 0x08, Digit8: 0x09, Digit9: 0x0A, Digit0: 0x0B,
+  Minus: 0x0C, Equal: 0x0D, Backspace: 0x0E, Tab: 0x0F,
+  KeyQ: 0x10, KeyW: 0x11, KeyE: 0x12, KeyR: 0x13, KeyT: 0x14, KeyY: 0x15, KeyU: 0x16,
+  KeyI: 0x17, KeyO: 0x18, KeyP: 0x19, BracketLeft: 0x1A, BracketRight: 0x1B,
+  Enter: 0x1C, ControlLeft: 0x1D,
+  KeyA: 0x1E, KeyS: 0x1F, KeyD: 0x20, KeyF: 0x21, KeyG: 0x22, KeyH: 0x23, KeyJ: 0x24,
+  KeyK: 0x25, KeyL: 0x26, Semicolon: 0x27, Quote: 0x28, Backquote: 0x29,
+  ShiftLeft: 0x2A, Backslash: 0x2B,
+  KeyZ: 0x2C, KeyX: 0x2D, KeyC: 0x2E, KeyV: 0x2F, KeyB: 0x30, KeyN: 0x31, KeyM: 0x32,
+  Comma: 0x33, Period: 0x34, Slash: 0x35, ShiftRight: 0x36,
+  AltLeft: 0x38, Space: 0x39, CapsLock: 0x3A,
+  F1: 0x3B, F2: 0x3C, F3: 0x3D, F4: 0x3E, F5: 0x3F, F6: 0x40, F7: 0x41, F8: 0x42,
+  F9: 0x43, F10: 0x44, F11: 0x57, F12: 0x58,
+  NumpadEnter: 0xE01C, ControlRight: 0xE01D, AltRight: 0xE038,
+  Insert: 0xE052, Delete: 0xE053, Home: 0xE047, End: 0xE04F,
+  PageUp: 0xE049, PageDown: 0xE051,
+  ArrowUp: 0xE048, ArrowDown: 0xE050, ArrowLeft: 0xE04B, ArrowRight: 0xE04D,
+  MetaLeft: 0xE05B, MetaRight: 0xE05C, ContextMenu: 0xE05D, NumpadDivide: 0xE035,
+};
+
+function rdpCanvasPos(e) {
+  const rect = rdpCanvas.getBoundingClientRect();
+  const scaleX = rdpCanvas.width / rect.width;
+  const scaleY = rdpCanvas.height / rect.height;
+  return {
+    x: Math.round((e.clientX - rect.left) * scaleX),
+    y: Math.round((e.clientY - rect.top) * scaleY),
+  };
+}
+
+// Resetting width (even to its current value) clears the canvas's drawing
+// buffer regardless of whether IronRDP's renderCanvas() got a 2D or WebGL
+// context from it — clearRect only works for the former, and this project
+// has no way to know which it uses internally.
+function clearRdpCanvas() {
+  rdpCanvas.width = rdpCanvas.width;
+}
+
+function rdpApply(event) {
+  if (!rdpSession) return;
+  const t = new IronRDP.InputTransaction();
+  t.addEvent(event);
+  rdpSession.applyInputs(t);
+}
 
 // Go (wasm) calls these:
 window.termWrite = (u8) => term.write(u8);
@@ -89,7 +145,7 @@ window.hostKeyConfirm = (host, port, keyType, fpr) => {
 // ---------- UI ----------
 const $ = (id) => document.getElementById(id);
 const defaultSshPort = $("port").value;
-const defaultVncPort = "5900";
+const defaultPorts = { ssh: defaultSshPort, vnc: "5900", rdp: "3389" };
 function setStatus(s) { $("status").textContent = s; }
 function toggle(on) {
   connected = on;
@@ -98,29 +154,30 @@ function toggle(on) {
   ["protocol", "host", "port", "user", "authType", "password", "passphrase", "key"].forEach((id) => $(id).disabled = on);
 }
 
-function isVnc() { return $("protocol").value === "vnc"; }
+function proto() { return $("protocol").value; }
 
 function syncAuthFields() {
-  const vnc = isVnc();
-  $("authType").style.display = vnc ? "none" : "inline-block";
-  const key = !vnc && $("authType").value === "key";
+  const keyCapable = proto() === "ssh";
+  $("authType").style.display = keyCapable ? "inline-block" : "none";
+  const key = keyCapable && $("authType").value === "key";
   $("key").style.display = key ? "block" : "none";
   $("passphrase").style.display = key ? "inline-block" : "none";
-  $("password").style.display = (vnc || !key) ? "inline-block" : "none";
+  $("password").style.display = (!keyCapable || !key) ? "inline-block" : "none";
 }
 
 $("authType").addEventListener("change", syncAuthFields);
 
 $("protocol").addEventListener("change", () => {
-  const vnc = isVnc();
-  termEl.style.display = vnc ? "none" : "block";
-  vncEl.style.display = vnc ? "block" : "none";
-  // Swap the port field's value between the two protocols' conventional
-  // defaults, but only if it still holds a default rather than something
-  // the user actually typed in.
+  const p = proto();
+  termEl.style.display = p === "ssh" ? "block" : "none";
+  vncEl.style.display = p === "vnc" ? "block" : "none";
+  rdpEl.style.display = p === "rdp" ? "block" : "none";
+  // Swap the port field's value between protocols' conventional defaults,
+  // but only if it still holds a default rather than something the user
+  // actually typed in.
   const current = $("port").value.trim();
-  if (current === "" || current === defaultSshPort || current === defaultVncPort) {
-    $("port").value = vnc ? defaultVncPort : defaultSshPort;
+  if (Object.values(defaultPorts).includes(current) || current === "") {
+    $("port").value = defaultPorts[p];
   }
   syncAuthFields();
 });
@@ -170,7 +227,7 @@ function doVncConnect() {
   const base = location.pathname.replace(/\/[^/]*$/, "");
   const wsBase = (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + base + "/ws";
   const host = $("host").value.trim();
-  const port = $("port").value.trim() || defaultVncPort;
+  const port = $("port").value.trim() || defaultPorts.vnc;
   const credentials = { username: $("user").value.trim(), password: $("password").value };
   // Clear as soon as it's handed off, so it doesn't linger in the DOM.
   $("password").value = "";
@@ -250,20 +307,157 @@ vncEl.addEventListener("keydown", (e) => {
   }).catch(() => {});
 }, true);
 
+// RDP's CLIPRDR channel only has the client push local clipboard content
+// once, in response to forceClipboardUpdateCallback right after the channel
+// comes up — there's no OS-level event for "clipboard changed outside the
+// browser", so content copied elsewhere while this tab was unfocused would
+// otherwise never reach the remote. Re-push on every focus regain, which is
+// the same heuristic real RDP/Citrix clients use.
+function pushLocalClipboardToRdp() {
+  if (!rdpSession) return;
+  navigator.clipboard.readText().then((text) => {
+    const data = new IronRDP.ClipboardData();
+    data.addText("text/plain", text);
+    rdpSession.onClipboardPaste(data);
+  }).catch(() => {});
+}
+window.addEventListener("focus", pushLocalClipboardToRdp);
+
+// RDP, like VNC, needs no wasm bridge — but unlike VNC/SSH, the gateway
+// itself has to speak a little RDP (see server/rdp.go) because a browser
+// can't open the raw TLS connection to the target that RDP needs; the
+// IronRDP wasm client talks to the gateway over /rdp via that RDCleanPath
+// handshake, then it's a plain byte relay same as the others.
+function doRdpConnect() {
+  const base = location.pathname.replace(/\/[^/]*$/, "");
+  const wsBase = (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + base + "/rdp";
+  const host = $("host").value.trim();
+  const port = $("port").value.trim() || defaultPorts.rdp;
+  const user = $("user").value.trim();
+  const password = $("password").value;
+  $("password").value = "";
+
+  const container = rdpEl.getBoundingClientRect();
+  const width = Math.max(320, Math.round(container.width)) || 1024;
+  const height = Math.max(240, Math.round(container.height)) || 768;
+
+  setStatus("connecting…");
+  toggle(true);
+
+  const builder = new IronRDP.SessionBuilder()
+    .proxyAddress(wsBase)
+    .destination(`${host}:${port}`)
+    .username(user)
+    .password(password)
+    // Required by the builder, but unused by our gateway: access is
+    // already gated by the cookie on the WebSocket upgrade, same as
+    // /ws and /resume, so there's no separate protocol-level credential
+    // to supply here.
+    .authToken("")
+    // Also required by the builder; we don't customize the cursor icon.
+    .setCursorStyleCallback(() => {})
+    .setCursorStyleCallbackContext(null)
+    // Unlike VNC's clipboardPasteFrom() push model, RDP's CLIPRDR channel
+    // is pull-based: once the channel comes up, this fires once so the
+    // client can push whatever's currently on the local clipboard; the
+    // remote caches it and serves it from that cache on an actual paste,
+    // so there's no need to intercept Ctrl+V here -- it already reaches
+    // the remote as an ordinary keystroke via RDP_SCANCODES. Later changes
+    // (e.g. made outside the browser) are caught by the focus-regain push
+    // above instead, since CLIPRDR itself has no "re-push now" callback.
+    .forceClipboardUpdateCallback(pushLocalClipboardToRdp)
+    // The remote's clipboard changed (e.g. the user copied something on
+    // the remote desktop) -- mirror it into the local clipboard, the same
+    // direction the focus-regain push above goes the other way. Fires with
+    // a single ClipboardData argument; take the first text item.
+    .remoteClipboardChangedCallback((data) => {
+      const item = data.items().find((i) => i.mimeType().startsWith("text/"));
+      if (item) navigator.clipboard.writeText(item.value()).catch(() => {});
+    })
+    .desktopSize(new IronRDP.DesktopSize(width, height))
+    .renderCanvas(rdpCanvas);
+
+  builder.connect().then((session) => {
+    rdpSession = session;
+    const size = session.desktopSize();
+    rdpCanvas.width = size.width;
+    rdpCanvas.height = size.height;
+    setStatus("connected to " + host);
+    rdpCanvas.focus();
+    session.run().then((info) => {
+      rdpSession = null;
+      toggle(false);
+      clearRdpCanvas();
+      setStatus("disconnected: " + info.reason());
+      focusHost();
+    });
+  }).catch((err) => {
+    rdpSession = null;
+    toggle(false);
+    setStatus("error: " + rdpErrorMessage(err));
+    focusHost();
+  });
+}
+
+// IronRDP's connect() rejects with a wasm-bound error object, not a plain
+// Error — it has no useful default string/JSON form (just an internal
+// pointer), so pull the message out via its own accessor methods instead.
+function rdpErrorMessage(err) {
+  if (err && typeof err.backtrace === "function") {
+    try { return err.backtrace(); } catch (e) { /* fall through */ }
+  }
+  return String(err);
+}
+
+rdpCanvas.addEventListener("mousemove", (e) => {
+  const p = rdpCanvasPos(e);
+  rdpApply(IronRDP.DeviceEvent.mouseMove(p.x, p.y));
+});
+rdpCanvas.addEventListener("mousedown", (e) => { e.preventDefault(); rdpCanvas.focus(); rdpApply(IronRDP.DeviceEvent.mouseButtonPressed(e.button)); });
+rdpCanvas.addEventListener("mouseup", (e) => { e.preventDefault(); rdpApply(IronRDP.DeviceEvent.mouseButtonReleased(e.button)); });
+rdpCanvas.addEventListener("contextmenu", (e) => e.preventDefault());
+rdpCanvas.addEventListener("wheel", (e) => {
+  e.preventDefault();
+  if (e.deltaY) rdpApply(IronRDP.DeviceEvent.wheelRotations(true, -e.deltaY, 0));
+  if (e.deltaX) rdpApply(IronRDP.DeviceEvent.wheelRotations(false, -e.deltaX, 0));
+}, { passive: false });
+rdpCanvas.addEventListener("keydown", (e) => {
+  if (!rdpSession) return;
+  e.preventDefault();
+  const code = RDP_SCANCODES[e.code];
+  if (code !== undefined) {
+    rdpApply(IronRDP.DeviceEvent.keyPressed(code));
+  } else if (e.key.length === 1) {
+    rdpApply(IronRDP.DeviceEvent.unicodePressed(e.key));
+  }
+});
+rdpCanvas.addEventListener("keyup", (e) => {
+  if (!rdpSession) return;
+  e.preventDefault();
+  const code = RDP_SCANCODES[e.code];
+  if (code !== undefined) {
+    rdpApply(IronRDP.DeviceEvent.keyReleased(code));
+  } else if (e.key.length === 1) {
+    rdpApply(IronRDP.DeviceEvent.unicodeReleased(e.key));
+  }
+});
+
 // Enter in host/port/user attempts a connect; if password auth needs a
 // password that isn't typed yet, this instead focuses the password field
 // (a "prompt") rather than connecting — a second Enter there confirms.
 function tryConnect() {
   if (connected) return;
-  const vnc = isVnc();
-  if (!vnc && !wasmReady) { setStatus("still loading…"); return; }
+  const p = proto();
+  if (p === "ssh" && !wasmReady) { setStatus("still loading…"); return; }
   if (!$("host").value.trim()) { $("host").focus(); return; }
-  if ((vnc || $("authType").value === "password") && !$("password").value) {
+  if ((p !== "ssh" || $("authType").value === "password") && !$("password").value) {
     setStatus("enter password, then press enter");
     $("password").focus();
     return;
   }
-  if (vnc) doVncConnect(); else doConnect();
+  if (p === "vnc") doVncConnect();
+  else if (p === "rdp") doRdpConnect();
+  else doConnect();
 }
 
 function focusHost() {
@@ -281,6 +475,7 @@ $("connect").addEventListener("click", tryConnect);
 
 $("disconnect").addEventListener("click", () => {
   if (rfb) rfb.disconnect();
+  else if (rdpSession) rdpSession.shutdown();
   else if (window.goSSHClose) window.goSSHClose();
 });
 
@@ -289,7 +484,7 @@ focusHost();
 term.onData((d) => { if (connected && window.goSSHWrite) window.goSSHWrite(d); });
 
 function syncTerminalSize() {
-  if (isVnc()) return;
+  if (proto() !== "ssh") return;
   fit.fit();
   if (connected && window.goSSHResize) window.goSSHResize(term.cols, term.rows);
 }

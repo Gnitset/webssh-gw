@@ -1,10 +1,12 @@
 # webssh-gw
 
-A browser SSH/VNC client where **all protocol crypto runs in the browser**
-(SSH via Go compiled to WebAssembly, VNC via [noVNC](https://github.com/novnc/noVNC))
-and the web server is only a **dumb WebSocket↔TCP byte relay**. A gate token
-sits in front; once you're past it you can connect to **any host:port**, all
-tunneled over `wss://` on 443.
+A browser SSH/VNC/RDP client where, for SSH and VNC, **all protocol crypto
+runs in the browser** (SSH via Go compiled to WebAssembly, VNC via
+[noVNC](https://github.com/novnc/noVNC)) and the web server is only a
+**dumb WebSocket↔TCP byte relay**. RDP (via
+[IronRDP](https://github.com/Devolutions/IronRDP)) is the one exception —
+see below. A gate token sits in front; once you're past it you can connect
+to **any host:port**, all tunneled over `wss://` on 443.
 
 ```
 Browser ──wss://gw/ws?host=H&port=P──►  nginx :443  ──►  webssh-gw relay  ──TCP──►  H:P (sshd/VNC)
@@ -23,6 +25,17 @@ VNC connection just reconnects cold, which is fine: unlike SSH, a lost byte
 doesn't kill anything, and the remote desktop session survives a client
 disconnect regardless).
 
+**RDP breaks that pattern, by necessity.** A browser can't open a raw TLS
+socket to an arbitrary RDP host itself, so the IronRDP wasm client uses a
+handshake called RDCleanPath: it sends the gateway the destination and the
+X.224 connection bytes it built, and the **gateway dials the target and
+performs the TLS handshake to it on the browser's behalf** (`server/rdp.go`),
+handing back the server's certificate chain for the browser to inspect.
+From that point on it's the same byte relay as SSH/VNC (and gets the same
+resumable-session support for free) — but the relay necessarily sees RDP
+plaintext in transit while doing so, where it never does for SSH or VNC.
+See the security notes below.
+
 Useful when you're stuck behind a locked-down environment — browser-only, all
 ports firewalled, all egress through a TLS-MITM proxy — and need to reach
 your own SSH servers. The outer `wss://` on 443 is expected to be MITM'd;
@@ -31,8 +44,9 @@ that's fine, since it only ever carries SSH ciphertext.
 ## Layout
 
 - `server/main.go` — relay + token gate (signed-cookie session) + static file server.
+- `server/rdp.go` — the RDCleanPath handshake: decodes the browser's request, dials the RDP target, does the TLS handshake with it, hands back the cert chain, then joins the same session/relay machinery `main.go` uses for everything else.
 - `client/main.go` — `//go:build js && wasm`; the SSH client; adapts a WebSocket to `net.Conn`.
-- `web/` — `index.html app.js style.css novnc-bridge.js` (the last is a thin ES-module shim exposing noVNC's `RFB` class to `app.js`, which is a classic script); everything else in here (`main.wasm wasm_exec.js xterm.js xterm.css addon-fit.js novnc/`) is fetched/built, not committed (see Build below).
+- `web/` — `index.html app.js style.css novnc-bridge.js iron-rdp-bridge.js` (the last two are thin ES-module shims exposing noVNC's `RFB` class and IronRDP's `Backend`, respectively, to `app.js`, which is a classic script); everything else in here (`main.wasm wasm_exec.js xterm.js xterm.css addon-fit.js novnc/ iron-remote-desktop-rdp.js`) is fetched/built, not committed (see Build below).
 - `Dockerfile`, `Makefile`, `systemd/webssh-gw.service`.
 
 ## Build
@@ -46,18 +60,22 @@ make
 ```
 
 This runs `go mod tidy`, builds the server and the wasm client, copies
-`wasm_exec.js`, and fetches the pinned xterm.js/addon-fit/noVNC versions into
-`web/` — a fresh clone needs nothing beyond this one command. These
-third-party assets aren't vendored in the repo (same reasoning as not
-vendoring the Go module dependencies): they're pinned by version in the
-`Makefile` (`XTERM_VERSION`, `ADDON_FIT_VERSION`, `NOVNC_VERSION`) and
-fetched once, cached in `web/` until `make clean`. noVNC in particular ships
-as a tree of ES modules rather than one bundled file, so its `Makefile`
-target pulls the npm tarball and extracts just the `core/` and
-`vendor/pako/` subtrees it needs into `web/novnc/`. They're still served
-from your own origin at runtime — that's a build-time fetch, not a
-browser-time one, so it doesn't reintroduce any CDN dependency for whoever
-actually uses the deployed gateway.
+`wasm_exec.js`, and fetches the pinned xterm.js/addon-fit/noVNC/IronRDP
+versions into `web/` — a fresh clone needs nothing beyond this one command,
+no Rust/wasm-pack toolchain included: IronRDP's web client
+(`@devolutions/iron-remote-desktop-rdp`) ships as a single prebuilt JS file
+with its wasm embedded as a base64 `data:` URI, so it's as much of a plain
+fetch as xterm.js is. These third-party assets aren't vendored in the repo
+(same reasoning as not vendoring the Go module dependencies): they're
+pinned by version in the `Makefile` (`XTERM_VERSION`, `ADDON_FIT_VERSION`,
+`NOVNC_VERSION`, `IRON_RDP_VERSION`) and fetched once, cached in `web/`
+until `make clean`. noVNC in particular ships as a tree of ES modules
+rather than one bundled file, so its `Makefile` target pulls the npm
+tarball and extracts just the `core/` and `vendor/pako/` subtrees it needs
+into `web/novnc/`. They're still served from your own origin at runtime —
+that's a build-time fetch, not a browser-time one, so it doesn't
+reintroduce any CDN dependency for whoever actually uses the deployed
+gateway.
 
 ### Or build the container image instead
 
@@ -187,6 +205,18 @@ For systemd, see `systemd/webssh-gw.service`.
   password (type 2) if that checkbox is enabled on the Mac. Leave that
   checkbox off so the Mac only ever offers the strong option. The Mac
   decides which types it advertises, not this gateway or the browser.
+- **VNC's auth types only protect the login, not the session.** Unlike SSH,
+  none of the VNC security types noVNC implements (ARD, RA2/RA2ne,
+  VeNCrypt-Plain) continue encrypting anything after the credential
+  exchange — screen contents, keystrokes and mouse input afterward travel
+  as plain RFB protocol bytes, protected only by the outer `wss://` TLS.
+  If that's MITM'd (see the top of this README), so is your VNC session.
+- **RDP: the relay sees plaintext, by design — see the top of this
+  README.** Unlike SSH/VNC, the gateway terminates the TLS connection to
+  the RDP target itself (RDCleanPath requires it — a browser can't open
+  that TLS connection on its own). Treat the gateway host itself as part
+  of the trust boundary for RDP sessions specifically; it isn't for SSH
+  or VNC.
 
 ## Known limitations
 

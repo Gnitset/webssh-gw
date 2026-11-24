@@ -9,6 +9,7 @@
 /web/xterm.css
 /web/addon-fit.js
 /web/novnc/
+/web/iron-remote-desktop-rdp.js
 
 # Local config/secrets — never commit real tokens/cookie-secret
 *.conf
