@@ -1,18 +1,27 @@
 # webssh-gw
 
-A browser SSH client where **all SSH crypto runs in the browser** (Go compiled
-to WebAssembly) and the web server is only a **dumb WebSocket↔TCP byte relay**.
-A gate token sits in front; once you're past it you can connect to **any
-host:port**, all tunneled over `wss://` on 443.
+A browser SSH/VNC client where **all protocol crypto runs in the browser**
+(SSH via Go compiled to WebAssembly, VNC via [noVNC](https://github.com/novnc/noVNC))
+and the web server is only a **dumb WebSocket↔TCP byte relay**. A gate token
+sits in front; once you're past it you can connect to **any host:port**, all
+tunneled over `wss://` on 443.
 
 ```
-Browser ──wss://gw/ws?host=H&port=P──►  nginx :443  ──►  webssh-gw relay  ──TCP──►  H:P (sshd)
-  │        (a MITM proxy in the path sees only SSH ciphertext)
-  └─ SSH2 handshake + ciphers happen HERE, in wasm
+Browser ──wss://gw/ws?host=H&port=P──►  nginx :443  ──►  webssh-gw relay  ──TCP──►  H:P (sshd/VNC)
+  │        (a MITM proxy in the path sees only SSH/VNC ciphertext)
+  └─ the SSH2 handshake + ciphers, or the VNC RFB handshake (including
+     Apple's Diffie-Hellman "ARD" auth for real macOS account logins),
+     happen HERE, in the browser
 ```
 
-Because the SSH layer is negotiated in the browser and terminated only on the
-target sshd, neither the relay nor the MITM proxy ever sees SSH plaintext.
+Because the protocol layer is negotiated in the browser and terminated only
+on the target (sshd / VNC server), neither the relay nor the MITM proxy ever
+sees SSH/VNC plaintext. The relay itself is 100% protocol-agnostic — it just
+dials `host:port` and pumps bytes — so VNC support needed no server-side
+changes at all, and doesn't use SSH's resumable-session machinery (a dropped
+VNC connection just reconnects cold, which is fine: unlike SSH, a lost byte
+doesn't kill anything, and the remote desktop session survives a client
+disconnect regardless).
 
 Useful when you're stuck behind a locked-down environment — browser-only, all
 ports firewalled, all egress through a TLS-MITM proxy — and need to reach
@@ -23,7 +32,7 @@ that's fine, since it only ever carries SSH ciphertext.
 
 - `server/main.go` — relay + token gate (signed-cookie session) + static file server.
 - `client/main.go` — `//go:build js && wasm`; the SSH client; adapts a WebSocket to `net.Conn`.
-- `web/` — `index.html app.js style.css`; everything else in here (`main.wasm wasm_exec.js xterm.js xterm.css addon-fit.js`) is fetched/built, not committed (see Build below).
+- `web/` — `index.html app.js style.css novnc-bridge.js` (the last is a thin ES-module shim exposing noVNC's `RFB` class to `app.js`, which is a classic script); everything else in here (`main.wasm wasm_exec.js xterm.js xterm.css addon-fit.js novnc/`) is fetched/built, not committed (see Build below).
 - `Dockerfile`, `Makefile`, `systemd/webssh-gw.service`.
 
 ## Build
@@ -37,14 +46,18 @@ make
 ```
 
 This runs `go mod tidy`, builds the server and the wasm client, copies
-`wasm_exec.js`, and fetches the pinned xterm.js/addon-fit versions into
-`web/` — a fresh clone needs nothing beyond this one command. The terminal
-assets aren't vendored in the repo (same reasoning as not vendoring the Go
-module dependencies): they're pinned by version in the `Makefile`
-(`XTERM_VERSION`, `ADDON_FIT_VERSION`) and fetched once, cached in `web/`
-until `make clean`. They're still served from your own origin at runtime —
-that's a build-time fetch, not a browser-time one, so it doesn't reintroduce
-any CDN dependency for whoever actually uses the deployed gateway.
+`wasm_exec.js`, and fetches the pinned xterm.js/addon-fit/noVNC versions into
+`web/` — a fresh clone needs nothing beyond this one command. These
+third-party assets aren't vendored in the repo (same reasoning as not
+vendoring the Go module dependencies): they're pinned by version in the
+`Makefile` (`XTERM_VERSION`, `ADDON_FIT_VERSION`, `NOVNC_VERSION`) and
+fetched once, cached in `web/` until `make clean`. noVNC in particular ships
+as a tree of ES modules rather than one bundled file, so its `Makefile`
+target pulls the npm tarball and extracts just the `core/` and
+`vendor/pako/` subtrees it needs into `web/novnc/`. They're still served
+from your own origin at runtime — that's a build-time fetch, not a
+browser-time one, so it doesn't reintroduce any CDN dependency for whoever
+actually uses the deployed gateway.
 
 ### Or build the container image instead
 
@@ -167,6 +180,33 @@ For systemd, see `systemd/webssh-gw.service`.
   friends in `validTarget()` in `server/main.go`.
 - Prefer private-key auth (the "private key" mode) over passwords; the key is
   parsed and used only in the browser and never sent to the relay.
+- **VNC: use real macOS account auth, not the legacy VNC password.** A Mac's
+  Screen Sharing/Remote Management can offer either Apple's Diffie-Hellman
+  "ARD" auth (real account credentials, security type 30 — what noVNC
+  negotiates automatically) or a separate weak, DES-based classic VNC
+  password (type 2) if that checkbox is enabled on the Mac. Leave that
+  checkbox off so the Mac only ever offers the strong option. The Mac
+  decides which types it advertises, not this gateway or the browser.
+
+## Known limitations
+
+- **VNC clipboard sync doesn't work against macOS's built-in Screen
+  Sharing server.** The client-side code is correct and protocol-complete
+  (`app.js` pushes the local clipboard via `RFB.clipboardPasteFrom()` and
+  listens for the server's `"clipboard"` event for the reverse direction) —
+  but Apple's server doesn't implement the standard RFB `ClientCutText`/
+  `ServerCutText` messages at all; it's well documented that Apple uses a
+  proprietary mechanism that only its own Screen Sharing app understands.
+  Verified directly: pushing via `clipboardPasteFrom()` never lands on the
+  remote's real pasteboard (checked with `pbpaste` over a Terminal session
+  on the target), and copying on the remote never fires noVNC's
+  `"clipboard"` event locally. No noVNC-side fix exists for this; it would
+  need either a non-Apple VNC server running on the target Mac (TigerVNC,
+  RealVNC — these implement the standard messages correctly), or a
+  separate side-channel over SSH (`pbcopy`/`pbpaste` on the target, reusing
+  this project's own SSH client) to drive the real clipboard directly. The
+  client-side code is left in place since it's correct for any
+  standards-compliant VNC server, just not for Apple's.
 
 ## If the proxy blocks WebSockets
 

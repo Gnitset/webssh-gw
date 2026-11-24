@@ -35,6 +35,8 @@ term.attachCustomKeyEventHandler((e) => {
 });
 
 let connected = false;
+let rfb = null;
+const vncEl = document.getElementById("vnc");
 
 // Go (wasm) calls these:
 window.termWrite = (u8) => term.write(u8);
@@ -86,19 +88,41 @@ window.hostKeyConfirm = (host, port, keyType, fpr) => {
 
 // ---------- UI ----------
 const $ = (id) => document.getElementById(id);
+const defaultSshPort = $("port").value;
+const defaultVncPort = "5900";
 function setStatus(s) { $("status").textContent = s; }
 function toggle(on) {
   connected = on;
   $("connect").disabled = on;
   $("disconnect").disabled = !on;
-  ["host", "port", "user", "authType", "password", "passphrase", "key"].forEach((id) => $(id).disabled = on);
+  ["protocol", "host", "port", "user", "authType", "password", "passphrase", "key"].forEach((id) => $(id).disabled = on);
 }
 
-$("authType").addEventListener("change", (e) => {
-  const key = e.target.value === "key";
+function isVnc() { return $("protocol").value === "vnc"; }
+
+function syncAuthFields() {
+  const vnc = isVnc();
+  $("authType").style.display = vnc ? "none" : "inline-block";
+  const key = !vnc && $("authType").value === "key";
   $("key").style.display = key ? "block" : "none";
   $("passphrase").style.display = key ? "inline-block" : "none";
-  $("password").style.display = key ? "none" : "inline-block";
+  $("password").style.display = (vnc || !key) ? "inline-block" : "none";
+}
+
+$("authType").addEventListener("change", syncAuthFields);
+
+$("protocol").addEventListener("change", () => {
+  const vnc = isVnc();
+  termEl.style.display = vnc ? "none" : "block";
+  vncEl.style.display = vnc ? "block" : "none";
+  // Swap the port field's value between the two protocols' conventional
+  // defaults, but only if it still holds a default rather than something
+  // the user actually typed in.
+  const current = $("port").value.trim();
+  if (current === "" || current === defaultSshPort || current === defaultVncPort) {
+    $("port").value = vnc ? defaultVncPort : defaultSshPort;
+  }
+  syncAuthFields();
 });
 
 async function doConnect() {
@@ -139,19 +163,107 @@ async function doConnect() {
   }
 }
 
+// VNC connects straight from the browser's native WebSocket into noVNC's
+// RFB class — unlike SSH, there's no crypto the browser can't already do
+// natively, so no wasm bridge is needed for this protocol.
+function doVncConnect() {
+  const base = location.pathname.replace(/\/[^/]*$/, "");
+  const wsBase = (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + base + "/ws";
+  const host = $("host").value.trim();
+  const port = $("port").value.trim() || defaultVncPort;
+  const credentials = { username: $("user").value.trim(), password: $("password").value };
+  // Clear as soon as it's handed off, so it doesn't linger in the DOM.
+  $("password").value = "";
+  const url = `${wsBase}?host=${encodeURIComponent(host)}&port=${encodeURIComponent(port)}`;
+  setStatus("connecting…");
+  toggle(true);
+  // A failed security negotiation fires both "securityfailure" (with the
+  // actual reason, e.g. a bad password) and then "disconnect" right after
+  // as the connection tears down — remember the former so the latter's
+  // generic message doesn't overwrite it.
+  let failureReason = null;
+  rfb = new RFB(vncEl, url, { credentials });
+  rfb.scaleViewport = true;
+  rfb.addEventListener("connect", () => {
+    setStatus("connected to " + host);
+    rfb.focus();
+    // noVNC deliberately shows no cursor at all (sets cursor:none on its
+    // internal canvas, in its own constructor, well before this point)
+    // until the server sends a real cursor-shape update — some servers,
+    // macOS Screen Sharing included, don't send one proactively and only
+    // do once the shape actually changes, which can take a while. Set a
+    // plain default cursor as a placeholder; noVNC's own update, whenever
+    // it arrives, overwrites this the same way it would've overwritten
+    // "none", so this doesn't fight it once the real cursor shows up.
+    const canvas = vncEl.querySelector("canvas");
+    if (canvas) canvas.style.cursor = "default";
+  });
+  // The remote proactively telling us its clipboard changed (e.g. the user
+  // copied something on the remote desktop) — mirror it into the local
+  // clipboard, the same direction Ctrl/Cmd+V below pushes.
+  rfb.addEventListener("clipboard", (e) => {
+    if (e.detail && typeof e.detail.text === "string") {
+      navigator.clipboard.writeText(e.detail.text).catch(() => {});
+    }
+  });
+  rfb.addEventListener("disconnect", (e) => {
+    rfb = null;
+    toggle(false);
+    if (failureReason) {
+      setStatus("auth failed: " + failureReason);
+    } else {
+      setStatus((e.detail && e.detail.clean) ? "disconnected" : "disconnected: connection lost");
+    }
+    focusHost();
+  });
+  rfb.addEventListener("securityfailure", (e) => {
+    failureReason = (e.detail && e.detail.reason) || "unknown reason";
+  });
+  rfb.addEventListener("credentialsrequired", () => {
+    setStatus("credentials required");
+  });
+}
+
+// noVNC forwards raw keystrokes to the remote by default, which for a
+// literal Ctrl/Cmd+V would just trigger a paste from the REMOTE's own
+// clipboard — not what's on the local one. Intercepted in the capture
+// phase on vncEl (the div RFB renders its canvas into), so this runs
+// before RFB's own keydown handler ever sees the event: push the local
+// clipboard to the remote first via the RFB clipboard protocol, then
+// synthesize the paste keystroke ourselves so it arrives after the
+// clipboard update it depends on, not racing it.
+const VNC_XK_CONTROL_L = 0xffe3;
+const VNC_XK_SUPER_L = 0xffeb; // what noVNC itself maps the Meta/Cmd key to
+const VNC_XK_V = 0x0076;
+vncEl.addEventListener("keydown", (e) => {
+  if (!rfb || e.key.toLowerCase() !== "v" || !(e.ctrlKey || e.metaKey)) return;
+  e.preventDefault();
+  e.stopPropagation();
+  const modKeysym = e.metaKey ? VNC_XK_SUPER_L : VNC_XK_CONTROL_L;
+  const modCode = e.metaKey ? "MetaLeft" : "ControlLeft";
+  navigator.clipboard.readText().then((text) => {
+    rfb.clipboardPasteFrom(text);
+    rfb.sendKey(modKeysym, modCode, true);
+    rfb.sendKey(VNC_XK_V, "KeyV", true);
+    rfb.sendKey(VNC_XK_V, "KeyV", false);
+    rfb.sendKey(modKeysym, modCode, false);
+  }).catch(() => {});
+}, true);
+
 // Enter in host/port/user attempts a connect; if password auth needs a
 // password that isn't typed yet, this instead focuses the password field
 // (a "prompt") rather than connecting — a second Enter there confirms.
 function tryConnect() {
   if (connected) return;
-  if (!wasmReady) { setStatus("still loading…"); return; }
+  const vnc = isVnc();
+  if (!vnc && !wasmReady) { setStatus("still loading…"); return; }
   if (!$("host").value.trim()) { $("host").focus(); return; }
-  if ($("authType").value === "password" && !$("password").value) {
+  if ((vnc || $("authType").value === "password") && !$("password").value) {
     setStatus("enter password, then press enter");
     $("password").focus();
     return;
   }
-  doConnect();
+  if (vnc) doVncConnect(); else doConnect();
 }
 
 function focusHost() {
@@ -168,7 +280,8 @@ $("connect").addEventListener("click", tryConnect);
 });
 
 $("disconnect").addEventListener("click", () => {
-  if (window.goSSHClose) window.goSSHClose();
+  if (rfb) rfb.disconnect();
+  else if (window.goSSHClose) window.goSSHClose();
 });
 
 focusHost();
@@ -176,6 +289,7 @@ focusHost();
 term.onData((d) => { if (connected && window.goSSHWrite) window.goSSHWrite(d); });
 
 function syncTerminalSize() {
+  if (isVnc()) return;
   fit.fit();
   if (connected && window.goSSHResize) window.goSSHResize(term.cols, term.rows);
 }
